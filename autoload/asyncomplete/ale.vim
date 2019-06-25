@@ -7,7 +7,60 @@ function! s:on_response(on_completions, conn_id, response) abort
   call a:on_completions(completions)
 endfunction
 
+function! s:on_tsserver_response(on_completions, conn_id, response) abort
+
+    if !s:is_completion_valid(get(a:response, 'request_seq'))
+        return
+    endif
+
+    if !has_key(a:response, 'body')
+        return
+    endif
+
+    let l:buffer = bufnr('')
+    let l:command = get(a:response, 'command', '')
+
+    if l:command is# 'completions'
+        let l:names = ale#completion#Filter(
+        \   l:buffer,
+        \   &filetype,
+        \   ale#completion#ParseTSServerCompletions(a:response),
+        \   b:ale_completion_info.prefix,
+        \)[: g:ale_completion_max_suggestions - 1]
+
+        " We need to remember some names for tsserver, as it doesn't send
+        " details back for everything we send.
+        call setbufvar(l:buffer, 'ale_tsserver_completion_names', l:names)
+
+        if !empty(l:names)
+            let b:ale_completion_info.request_id = ale#lsp#Send(
+            \   b:ale_completion_info.conn_id,
+            \   ale#lsp#tsserver_message#CompletionEntryDetails(
+            \       l:buffer,
+            \       b:ale_completion_info.line,
+            \       b:ale_completion_info.column,
+            \       l:names,
+            \   ),
+            \)
+        endif
+    elseif l:command is# 'completionEntryDetails'
+      let completions = ale#completion#ParseTSServerCompletionEntryDetails(a:response)
+      call a:on_completions(completions)
+    endif
+endfunction
+
 function! s:OnReady(F, linter, lsp_details) abort
+  let l:id = a:lsp_details.connection_id
+
+  if !ale#lsp#HasCapability(l:id, 'completion')
+      return
+  endif
+
+  " If we have sent a completion request already, don't send another.
+  if b:ale_completion_info.request_id
+      return
+  endif
+
   let l:id = a:lsp_details.connection_id
 
   if !ale#lsp#HasCapability(l:id, 'completion')
@@ -16,28 +69,38 @@ function! s:OnReady(F, linter, lsp_details) abort
 
   let l:buffer = a:lsp_details.buffer
   let l:id = a:lsp_details.connection_id
+  let l:root = a:lsp_details.project_root
 
-  " If we have sent a completion request already, don't send another.
-  if b:ale_completion_info.request_id
-      return
-  endif
-
-  let l:Callback = function('s:on_response', [a:F])
+  let l:Callback = a:linter.lsp is# 'tsserver'
+  \   ? function('s:on_tsserver_response', [a:F])
+  \   : function('s:on_response', [a:F])
   call ale#lsp#RegisterCallback(l:id, l:Callback)
 
-  " Send a message saying the buffer has changed first, otherwise
-  " completions won't know what text is nearby.
-  call ale#lsp#NotifyForChanges(l:id, l:buffer)
+  if a:linter.lsp is# 'tsserver'
+    let l:message = ale#lsp#tsserver_message#Completions(
+    \   l:buffer,
+    \   b:ale_completion_info.line,
+    \   b:ale_completion_info.column,
+    \   b:ale_completion_info.prefix,
+    \)
+  else
+    " Send a message saying the buffer has changed first, otherwise
+    " completions won't know what text is nearby.
+    call ale#lsp#NotifyForChanges(l:id, l:root, l:buffer)
 
-  " For LSP completions, we need to clamp the column to the length of
-  " the line. python-language-server and perhaps others do not implement
-  " this correctly.
-  let l:message = ale#lsp#message#Completion(
-  \   l:buffer,
-  \   b:ale_completion_info.line,
-  \   b:ale_completion_info.column,
-  \   ale#completion#GetTriggerCharacter(&filetype, b:ale_completion_info.prefix),
-  \)
+    " For LSP completions, we need to clamp the column to the length of
+    " the line. python-language-server and perhaps others do not implement
+    " this correctly.
+    let l:message = ale#lsp#message#Completion(
+    \   l:buffer,
+    \   b:ale_completion_info.line,
+    \   min([
+    \       b:ale_completion_info.line_length,
+    \       b:ale_completion_info.column,
+    \   ]),
+    \   ale#completion#GetTriggerCharacter(&filetype, b:ale_completion_info.prefix),
+    \)
+  endif
 
   let l:request_id = ale#lsp#Send(l:id, l:message)
 
